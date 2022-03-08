@@ -36,10 +36,17 @@ impl TypeMapKey for CommandCounter {
     type Value = Arc<DashMap<String, u64>>;
 }
 
+#[derive(Clone)]
+struct Poll {
+    owner: User,
+    responses: DashMap<User, String>,
+    open: bool,
+}
+
 struct PollData;
 
 impl TypeMapKey for PollData {
-    type Value = Arc<DashMap<String, (User, DashMap<User, String>)>>;
+    type Value = Arc<DashMap<String, Poll>>;
 }
 
 async fn increment_command(ctx: &Context, command: &str) {
@@ -116,28 +123,50 @@ async fn handle_poll_new(ctx: &Context, command: &ApplicationCommandInteraction)
             .collect::<Vec<String>>()
     };
 
-    {
+    if {
         let data_read = ctx.data.read().await;
         let poll_map = data_read
             .get::<PollData>()
             .expect("Expected PollData in TypeMap.")
             .clone();
-        poll_map.insert(poll_id.clone(), (owner.clone(), DashMap::default()));
+        let success = match poll_map.entry(poll_id.clone()) {
+            Occupied(_) => false,
+            Vacant(entry) => {
+                entry.insert(Poll {
+                    owner: owner.clone(),
+                    responses: DashMap::default(),
+                    open: true,
+                });
+                true
+            }
+        };
+        success
+    } {
+        command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content(format!("{}{}{}", poll_prompt, COUNT_LEADER, 0));
+                        message.components(|components| {
+                            components.add_action_row(create_poll_row(&poll_id, &poll_options))
+                        });
+                        message
+                    })
+            })
+            .await
+    } else {
+        command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("Poll with that id already exists.");
+                        message
+                    })
+            })
+            .await
     }
-
-    command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| {
-                    message.content(format!("{}{}{}", poll_prompt, COUNT_LEADER, 0));
-                    message.components(|components| {
-                        components.add_action_row(create_poll_row(&poll_id, &poll_options))
-                    });
-                    message
-                })
-        })
-        .await
 }
 
 async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
@@ -159,7 +188,7 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
     };
 
     let content = {
-        if let Some((owner, response_map)) = {
+        if let Some(poll) = {
             let data_read = ctx.data.read().await;
             let poll_map = data_read
                 .get::<PollData>()
@@ -169,7 +198,7 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
         } {
             let counts = {
                 let mut counts: HashMap<String, u64> = HashMap::new();
-                for kv in response_map.iter() {
+                for kv in poll.responses.iter() {
                     *counts.entry(kv.value().clone()).or_insert(0) += 1;
                 }
                 counts
@@ -183,8 +212,8 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
                 report
             };
 
-            if user == &owner {
-                match owner.create_dm_channel(&ctx.http).await {
+            if user == &poll.owner {
+                match poll.owner.create_dm_channel(&ctx.http).await {
                     Ok(channel) => {
                         match channel
                             .send_message(&ctx.http, |message| {
@@ -225,6 +254,118 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
         .await
 }
 
+async fn handle_poll_close(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
+    let user: &User = &command.user;
+
+    let options: HashMap<String, ApplicationCommandInteractionDataOptionValue> = command
+        .data
+        .options
+        .iter()
+        .filter_map(|o| match &o.resolved {
+            Some(v) => Some((o.name.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let poll_id = match options.get("id").expect("expected poll id") {
+        ApplicationCommandInteractionDataOptionValue::String(s) => s,
+        _ => panic!("poll id must be String"),
+    };
+
+    let content = {
+        if let Some(owner) = {
+            let data_read = ctx.data.read().await;
+            let poll_map = data_read
+                .get::<PollData>()
+                .expect("Expected PollData in TypeMap.")
+                .clone();
+            poll_map.get(poll_id).map(|kv| kv.value().owner.clone())
+        } {
+            if user == &owner {
+                let data_read = ctx.data.read().await;
+                let poll_map = data_read
+                    .get::<PollData>()
+                    .expect("Expected PollData in TypeMap.")
+                    .clone();
+                poll_map
+                    .entry(poll_id.clone())
+                    .and_modify(|poll| poll.open = false);
+                "Poll closed."
+            } else {
+                "Not an owner of this poll."
+            }
+        } else {
+            "No poll with that ID."
+        }
+    };
+
+    command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| {
+                    message.content(content);
+                    message
+                })
+        })
+        .await
+}
+
+async fn handle_poll_delete(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
+    let user: &User = &command.user;
+
+    let options: HashMap<String, ApplicationCommandInteractionDataOptionValue> = command
+        .data
+        .options
+        .iter()
+        .filter_map(|o| match &o.resolved {
+            Some(v) => Some((o.name.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let poll_id = match options.get("id").expect("expected poll id") {
+        ApplicationCommandInteractionDataOptionValue::String(s) => s,
+        _ => panic!("poll id must be String"),
+    };
+
+    let content = {
+        if let Some(owner) = {
+            let data_read = ctx.data.read().await;
+            let poll_map = data_read
+                .get::<PollData>()
+                .expect("Expected PollData in TypeMap.")
+                .clone();
+            poll_map.get(poll_id).map(|kv| kv.value().owner.clone())
+        } {
+            if user == &owner {
+                let data_read = ctx.data.read().await;
+                let poll_map = data_read
+                    .get::<PollData>()
+                    .expect("Expected PollData in TypeMap.")
+                    .clone();
+                poll_map.remove(poll_id);
+                "Poll deleted."
+            } else {
+                "Not an owner of this poll."
+            }
+        } else {
+            "No poll with that ID."
+        }
+    };
+
+    command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| {
+                    message.content(content);
+                    message
+                })
+        })
+        .await
+}
+
 async fn handle_default(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
     reply_to_command(ctx, command, &"Unimplmented command".to_string()).await
 }
@@ -242,6 +383,8 @@ async fn handle_application_command(ctx: &Context, command: &ApplicationCommandI
     if let Err(why) = match command_name {
         "poll-new" => handle_poll_new(&ctx, &command).await,
         "poll-results" => handle_poll_results(&ctx, &command).await,
+        "poll-close" => handle_poll_close(&ctx, &command).await,
+        "poll-delete" => handle_poll_delete(&ctx, &command).await,
         _ => handle_default(&ctx, &command).await,
     } {
         println!("Cannot respond to slash command {}: {}", command_name, why);
@@ -269,10 +412,12 @@ async fn handle_poll_response(
             .expect("Expected PollData in TypeMap.")
             .clone();
 
-        let count = match poll_map.entry(poll_id).and_modify(|(_, response_map)| {
-            response_map.insert(component.user.clone(), poll_option);
+        let count = match poll_map.entry(poll_id).and_modify(|poll| {
+            if poll.open {
+                poll.responses.insert(component.user.clone(), poll_option);
+            }
         }) {
-            Occupied(e) => Some(e.get().1.len()),
+            Occupied(e) => Some(e.get().responses.len()),
             Vacant(_) => None,
         };
         count
@@ -362,7 +507,7 @@ impl EventHandler for Handler {
                             option
                                 .name("options")
                                 .description(format!(
-                                    "List of options separated by {0} e.g: A{0}B{0}C{0}D",
+                                    "List of options separated by {0} e.g: A{0}B{0}C{0}D (max 5)",
                                     OPTION_SEPARATOR
                                 ))
                                 .kind(ApplicationCommandOptionType::String)
@@ -373,6 +518,30 @@ impl EventHandler for Handler {
                     command
                         .name("poll-results")
                         .description("Retrieve poll results (poll owner only)")
+                        .create_option(|option| {
+                            option
+                                .name("id")
+                                .description("Unique ID string for poll")
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                        })
+                })
+                .create_application_command(|command| {
+                    command
+                        .name("poll-close")
+                        .description("Stop accepting responses (poll owner only)")
+                        .create_option(|option| {
+                            option
+                                .name("id")
+                                .description("Unique ID string for poll")
+                                .kind(ApplicationCommandOptionType::String)
+                                .required(true)
+                        })
+                })
+                .create_application_command(|command| {
+                    command
+                        .name("poll-delete")
+                        .description("Irrevocably delete poll (poll owner only)")
                         .create_option(|option| {
                             option
                                 .name("id")
