@@ -66,47 +66,6 @@ async fn reply_to_command(
         .await
 }
 
-async fn get_stats_message(ctx: &Context) -> String {
-    let data_read = ctx.data.read().await;
-    let counter = data_read
-        .get::<CommandCounter>()
-        .expect("Expected CommandCounter in TypeMap.")
-        .clone();
-    counter
-        .iter()
-        .map(|kv| format!("{}: {}", kv.key(), kv.value()))
-        .collect::<Vec<String>>()
-        .join("\n")
-}
-
-async fn handle_stats(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
-    reply_to_command(ctx, command, &get_stats_message(&ctx).await).await
-}
-
-async fn handle_ping(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
-    reply_to_command(ctx, command, &"pong".to_string()).await
-}
-
-async fn handle_id(ctx: &Context, command: &ApplicationCommandInteraction) -> Result<()> {
-    let options = command
-        .data
-        .options
-        .get(0)
-        .expect("Expected user option")
-        .resolved
-        .as_ref()
-        .expect("Expected user object");
-
-    let content = if let ApplicationCommandInteractionDataOptionValue::User(user, _member) = options
-    {
-        format!("{}'s id is {}", user.tag(), user.id)
-    } else {
-        "Please provide a valid user".to_string()
-    };
-
-    reply_to_command(ctx, command, &content).await
-}
-
 fn create_poll_button(id: &String, option: &String) -> CreateButton {
     let mut butt = CreateButton::default();
     butt.custom_id(format!("{}{}{}", id, ID_SEPARATOR, option));
@@ -157,11 +116,6 @@ async fn handle_poll_new(ctx: &Context, command: &ApplicationCommandInteraction)
             .collect::<Vec<String>>()
     };
 
-    println!(
-        "id: {:?}, prompt: {:?}, options: {:?}",
-        poll_id, poll_prompt, poll_options
-    );
-
     {
         let data_read = ctx.data.read().await;
         let poll_map = data_read
@@ -204,8 +158,6 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
         _ => panic!("poll id must be String"),
     };
 
-    println!("id: {:?}", poll_id);
-
     let content = {
         if let Some((owner, response_map)) = {
             let data_read = ctx.data.read().await;
@@ -234,10 +186,13 @@ async fn handle_poll_results(ctx: &Context, command: &ApplicationCommandInteract
             if user == &owner {
                 match owner.create_dm_channel(&ctx.http).await {
                     Ok(channel) => {
-                        match channel.send_message(&ctx.http, |message| {
-                            message.content(report);
-                            message
-                        }).await {
+                        match channel
+                            .send_message(&ctx.http, |message| {
+                                message.content(report);
+                                message
+                            })
+                            .await
+                        {
                             Ok(_message) => "Results sent by direct message.",
                             Err(e) => {
                                 println!("Failed to send message: {}", e);
@@ -285,9 +240,6 @@ async fn handle_application_command(ctx: &Context, command: &ApplicationCommandI
     increment_command(&ctx, command_name).await;
 
     if let Err(why) = match command_name {
-        "stats" => handle_stats(&ctx, &command).await,
-        "ping" => handle_ping(&ctx, &command).await,
-        "id" => handle_id(&ctx, &command).await,
         "poll-new" => handle_poll_new(&ctx, &command).await,
         "poll-results" => handle_poll_results(&ctx, &command).await,
         _ => handle_default(&ctx, &command).await,
@@ -353,17 +305,8 @@ async fn handle_poll_response(
 }
 
 async fn handle_message_component(ctx: &Context, component: &MessageComponentInteraction) {
-    println!(
-        "Got message component interaction by {} with custom_id: {}",
-        component.user.tag(),
-        component.data.custom_id
-    );
-
     if let Err(why) = handle_poll_response(&ctx, &component).await {
-        println!(
-            "Failed to handle component interaction {}: {}",
-            component.data.custom_id, why
-        );
+        println!("Failed to handle component interaction: {}", why);
     }
 }
 
@@ -380,7 +323,7 @@ impl EventHandler for Handler {
                 handle_message_component(&ctx, &command).await
             }
             _ => {
-                println!("Unhandled interaction")
+                println!("Unhandled interaction: {:?}", interaction)
             }
         };
     }
@@ -397,24 +340,6 @@ impl EventHandler for Handler {
 
         let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
             commands
-                .create_application_command(|command| {
-                    command.name("stats").description("Get command stats")
-                })
-                .create_application_command(|command| {
-                    command.name("ping").description("A ping command")
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("id")
-                        .description("Get a user id")
-                        .create_option(|option| {
-                            option
-                                .name("id")
-                                .description("The user to lookup")
-                                .kind(ApplicationCommandOptionType::User)
-                                .required(true)
-                        })
-                })
                 .create_application_command(|command| {
                     command
                         .name("poll-new")
